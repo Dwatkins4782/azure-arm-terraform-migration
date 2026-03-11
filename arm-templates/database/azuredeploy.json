@@ -1,0 +1,229 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environment": {
+      "type": "string",
+      "allowedValues": ["dev", "staging", "prod"]
+    },
+    "sqlAdminLogin": {
+      "type": "string"
+    },
+    "sqlAdminPassword": {
+      "type": "securestring"
+    },
+    "aadAdminObjectId": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure AD Object ID for the SQL Admin group"
+      }
+    },
+    "aadAdminLogin": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure AD Admin group display name"
+      }
+    },
+    "privateEndpointSubnetId": {
+      "type": "string"
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string"
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    }
+  },
+  "variables": {
+    "sqlServerName": "[concat('sql-healthcare-', parameters('environment'))]",
+    "sqlDbName": "[concat('sqldb-healthcare-', parameters('environment'))]",
+    "sqlPeName": "[concat('pe-sql-', parameters('environment'))]",
+    "sqlPrivateDnsZoneName": "privatelink.database.windows.net",
+    "sqlAuditStorageName": "[concat('stsqlaudit', parameters('environment'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-01-01",
+      "name": "[variables('sqlAuditStorageName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "minimumTlsVersion": "TLS1_2",
+        "supportsHttpsTrafficOnly": true,
+        "publicNetworkAccess": "Disabled",
+        "encryption": {
+          "services": {
+            "blob": {
+              "enabled": true
+            }
+          },
+          "keySource": "Microsoft.Storage"
+        }
+      },
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa",
+        "purpose": "sql-audit-logs"
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers",
+      "apiVersion": "2023-05-01-preview",
+      "name": "[variables('sqlServerName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa",
+        "data-classification": "phi",
+        "managed-by": "arm-template"
+      },
+      "properties": {
+        "administratorLogin": "[parameters('sqlAdminLogin')]",
+        "administratorLoginPassword": "[parameters('sqlAdminPassword')]",
+        "minimalTlsVersion": "1.2",
+        "publicNetworkAccess": "Disabled",
+        "administrators": {
+          "administratorType": "ActiveDirectory",
+          "login": "[parameters('aadAdminLogin')]",
+          "sid": "[parameters('aadAdminObjectId')]",
+          "tenantId": "[subscription().tenantId]",
+          "azureADOnlyAuthentication": false
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers/databases",
+      "apiVersion": "2023-05-01-preview",
+      "name": "[concat(variables('sqlServerName'), '/', variables('sqlDbName'))]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', variables('sqlServerName'))]"
+      ],
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa",
+        "data-classification": "phi"
+      },
+      "sku": {
+        "name": "GP_Gen5",
+        "tier": "GeneralPurpose",
+        "family": "Gen5",
+        "capacity": 4
+      },
+      "properties": {
+        "collation": "SQL_Latin1_General_CP1_CI_AS",
+        "maxSizeBytes": 34359738368,
+        "zoneRedundant": true,
+        "readScale": "Enabled",
+        "requestedBackupStorageRedundancy": "Geo",
+        "isLedgerOn": true
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers/auditingSettings",
+      "apiVersion": "2023-05-01-preview",
+      "name": "[concat(variables('sqlServerName'), '/default')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', variables('sqlServerName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('sqlAuditStorageName'))]"
+      ],
+      "properties": {
+        "state": "Enabled",
+        "storageEndpoint": "[reference(resourceId('Microsoft.Storage/storageAccounts', variables('sqlAuditStorageName'))).primaryEndpoints.blob]",
+        "storageAccountAccessKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('sqlAuditStorageName')), '2023-01-01').keys[0].value]",
+        "retentionDays": 365,
+        "auditActionsAndGroups": [
+          "SUCCESSFUL_DATABASE_AUTHENTICATION_GROUP",
+          "FAILED_DATABASE_AUTHENTICATION_GROUP",
+          "BATCH_COMPLETED_GROUP",
+          "DATABASE_PERMISSION_CHANGE_GROUP",
+          "DATABASE_PRINCIPAL_CHANGE_GROUP",
+          "SCHEMA_OBJECT_ACCESS_GROUP"
+        ],
+        "isAzureMonitorTargetEnabled": true
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers/advancedThreatProtectionSettings",
+      "apiVersion": "2023-05-01-preview",
+      "name": "[concat(variables('sqlServerName'), '/Default')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', variables('sqlServerName'))]"
+      ],
+      "properties": {
+        "state": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers/vulnerabilityAssessments",
+      "apiVersion": "2023-05-01-preview",
+      "name": "[concat(variables('sqlServerName'), '/default')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', variables('sqlServerName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('sqlAuditStorageName'))]",
+        "[resourceId('Microsoft.Sql/servers/advancedThreatProtectionSettings', variables('sqlServerName'), 'Default')]"
+      ],
+      "properties": {
+        "storageContainerPath": "[concat(reference(resourceId('Microsoft.Storage/storageAccounts', variables('sqlAuditStorageName'))).primaryEndpoints.blob, 'vulnerability-assessment')]",
+        "storageAccountAccessKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('sqlAuditStorageName')), '2023-01-01').keys[0].value]",
+        "recurringScans": {
+          "isEnabled": true,
+          "emailSubscriptionAdmins": true
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers/databases/transparentDataEncryption",
+      "apiVersion": "2023-05-01-preview",
+      "name": "[concat(variables('sqlServerName'), '/', variables('sqlDbName'), '/current')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers/databases', variables('sqlServerName'), variables('sqlDbName'))]"
+      ],
+      "properties": {
+        "state": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Network/privateEndpoints",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('sqlPeName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', variables('sqlServerName'))]"
+      ],
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa"
+      },
+      "properties": {
+        "subnet": {
+          "id": "[parameters('privateEndpointSubnetId')]"
+        },
+        "privateLinkServiceConnections": [
+          {
+            "name": "[variables('sqlPeName')]",
+            "properties": {
+              "privateLinkServiceId": "[resourceId('Microsoft.Sql/servers', variables('sqlServerName'))]",
+              "groupIds": ["sqlServer"]
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "sqlServerFqdn": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Sql/servers', variables('sqlServerName'))).fullyQualifiedDomainName]"
+    },
+    "sqlDatabaseId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Sql/servers/databases', variables('sqlServerName'), variables('sqlDbName'))]"
+    }
+  }
+}

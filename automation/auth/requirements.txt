@@ -1,0 +1,56 @@
+# =============================================================================
+# Python Dependencies for OAuth 2.0 and SAML Authentication Modules
+# =============================================================================
+# Install: pip install -r requirements.txt
+# =============================================================================
+
+# --- OAuth 2.0 Dependencies ---
+
+# Microsoft Authentication Library (MSAL) for Python.
+# Implements OAuth 2.0 flows for Azure AD (Entra ID):
+#   - Client credentials grant (client_id + client_secret)
+#   - Token exchange for workload identity federation (OIDC)
+#   - Device code flow, authorization code flow (interactive)
+#   - Built-in token caching and automatic refresh
+msal>=1.28.0,<2.0.0
+
+# HTTP library for IMDS (managed identity) token acquisition
+# and general API calls to Azure Resource Manager.
+requests>=2.31.0,<3.0.0
+
+# JWT (JSON Web Token) library for decoding and validating
+# OAuth 2.0 access tokens and OIDC ID tokens.
+# Used to inspect token claims for debugging and audit logging.
+PyJWT[crypto]>=2.8.0,<3.0.0
+
+# --- SAML Dependencies ---
+
+# python3-saml: Full SAML 2.0 SP toolkit.
+# Handles AuthnRequest generation, response parsing, signature
+# validation, and metadata generation.
+# Wraps xmlsec1 (C library) for XML signature operations.
+python3-saml>=1.16.0,<2.0.0
+
+# signxml: Pure-Python XML signature library (XMLDSig).
+# Used as an alternative to xmlsec1 for SAML signature validation.
+# Preferred in containerized environments where xmlsec1 may not be available.
+signxml>=3.2.0,<4.0.0
+
+# lxml: XML processing library used by both signxml and python3-saml.
+# Required for parsing SAML assertions and generating SP metadata.
+lxml>=5.1.0,<6.0.0
+
+# --- Cryptography ---
+
+# Core cryptography library for certificate operations:
+#   - Loading and parsing X.509 certificates
+#   - RSA/ECDSA key operations for SAML signature validation
+#   - Certificate chain verification
+cryptography>=42.0.0,<43.0.0
+
+# --- Optional: Development and Testing ---
+
+# pytest for unit testing auth flows
+# pytest>=8.0.0,<9.0.0
+# pytest-mock>=3.12.0,<4.0.0
+# responses>=0.25.0,<1.0.0  # Mock HTTP requests for IMDS testing

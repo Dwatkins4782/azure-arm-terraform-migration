@@ -1,0 +1,20 @@
+{
+  "scriptFile": "event_grid_handler.py",
+  "entryPoint": "main",
+  "bindings": [
+    {
+      "type": "eventGridTrigger",
+      "name": "event",
+      "direction": "in",
+      "dataType": "string"
+    }
+  ],
+  "description": "Azure Function binding configuration for the Event Grid infrastructure change handler. This function is triggered automatically by Azure Event Grid when resource write or delete events occur in the monitored resource group. The Event Grid trigger binding deserializes the incoming event into an azure.functions.EventGridEvent object, which is passed to the main() entry point in event_grid_handler.py. The subscription-level filtering (configured in event_grid_terraform.tf) ensures that only relevant resource lifecycle events reach this function, reducing unnecessary invocations and cost. Retry behavior is managed by the Event Grid subscription (30 attempts over 24 hours) rather than at the function level, with undeliverable events routed to a dead-letter storage container.",
+  "disabled": false,
+  "retry": {
+    "strategy": "exponentialBackoff",
+    "maxRetryCount": 3,
+    "minimumInterval": "00:00:05",
+    "maximumInterval": "00:05:00"
+  }
+}

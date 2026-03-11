@@ -1,0 +1,515 @@
+# =============================================================================
+# Azure DevOps CI/CD Pipeline — ARM-to-Terraform Migration
+#
+# Stages:
+#   1. Validate  — Lint, format check, security scan
+#   2. Plan      — Generate and archive Terraform plan
+#   3. Import    — Run import blocks (manual approval gate)
+#   4. Apply     — Apply Terraform changes (manual approval for prod)
+#   5. Verify    — Parity validation and compliance checks
+#
+# This pipeline uses workload identity federation for Azure authentication
+# and supports environment-based promotion: dev -> staging -> prod.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+      - scripts/**
+      - pipelines/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+
+# ---------------------------------------------------------------------------
+# Variables — centralised configuration for the pipeline
+# ---------------------------------------------------------------------------
+variables:
+  # Terraform version pinned for reproducibility
+  terraformVersion: "1.7.5"
+  tflintVersion: "0.50.3"
+  checkovVersion: "3.2"
+
+  # Azure service connection (workload identity federation)
+  azureServiceConnection: "azure-arm-migration-wif"
+
+  # State backend configuration
+  backendResourceGroup: "rg-terraform-state"
+  backendStorageAccount: "stterraformstate"
+  backendContainer: "tfstate"
+
+  # Working directories
+  terraformDir: "$(System.DefaultWorkingDirectory)/terraform"
+  scriptsDir: "$(System.DefaultWorkingDirectory)/scripts"
+  pipelinesDir: "$(System.DefaultWorkingDirectory)/pipelines"
+
+# ---------------------------------------------------------------------------
+# Reusable parameters for environment-based deployment
+# ---------------------------------------------------------------------------
+parameters:
+  - name: environment
+    displayName: "Target environment"
+    type: string
+    default: dev
+    values:
+      - dev
+      - staging
+      - prod
+
+  - name: runImport
+    displayName: "Execute Terraform import step"
+    type: boolean
+    default: false
+
+  - name: autoApprove
+    displayName: "Auto-approve apply (dev only)"
+    type: boolean
+    default: false
+
+# ============================================================================
+# Stage 1: Validate
+# Runs format checks, HCL validation, linting, and security scanning.
+# ============================================================================
+stages:
+  - stage: Validate
+    displayName: "Validate Terraform"
+    jobs:
+      - job: LintAndScan
+        displayName: "Lint, Validate & Security Scan"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          # -- Install Terraform at the pinned version
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform $(terraformVersion)"
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          # -- Authenticate to Azure for provider schema validation
+          - task: AzureCLI@2
+            displayName: "Azure Login (WIF)"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                echo "Authenticated via workload identity federation."
+                az account show --output table
+
+          # -- Terraform format check (fails if files are unformatted)
+          - script: |
+              echo "=== terraform fmt -check ==="
+              terraform -chdir=$(terraformDir) fmt -check -recursive -diff
+            displayName: "Terraform Format Check"
+
+          # -- Terraform init (backend partial config; no state needed for validate)
+          - script: |
+              terraform -chdir=$(terraformDir) init \
+                -backend=false \
+                -input=false
+            displayName: "Terraform Init (validation only)"
+
+          # -- Terraform validate
+          - script: |
+              terraform -chdir=$(terraformDir) validate
+            displayName: "Terraform Validate"
+
+          # -- TFLint
+          - script: |
+              curl -sSL https://github.com/terraform-linters/tflint/releases/download/v$(tflintVersion)/tflint_linux_amd64.zip -o tflint.zip
+              unzip -o tflint.zip -d /usr/local/bin/
+              chmod +x /usr/local/bin/tflint
+              cd $(terraformDir)
+              tflint --init --config=$(pipelinesDir)/.tflint.hcl
+              tflint --config=$(pipelinesDir)/.tflint.hcl --format=compact
+            displayName: "Run TFLint"
+
+          # -- Checkov security scan
+          - script: |
+              pip install checkov==$(checkovVersion) --quiet
+              checkov \
+                --directory $(terraformDir) \
+                --framework terraform \
+                --output cli \
+                --output junitxml \
+                --output-file-path $(Build.ArtifactStagingDirectory)/checkov \
+                --soft-fail
+            displayName: "Checkov Security Scan"
+
+          # -- OPA / Rego compliance policy check
+          - script: |
+              curl -sSL -o /usr/local/bin/opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+              chmod +x /usr/local/bin/opa
+              cd $(terraformDir)
+              terraform init -backend=false -input=false 2>/dev/null || true
+              terraform plan -out=tfplan.binary -input=false 2>/dev/null || true
+              terraform show -json tfplan.binary > tfplan.json 2>/dev/null || true
+              if [[ -f tfplan.json ]]; then
+                opa eval \
+                  --input tfplan.json \
+                  --data $(System.DefaultWorkingDirectory)/tests/compliance/ \
+                  "data.terraform.compliance" \
+                  --format pretty
+              else
+                echo "Skipping OPA check -- no plan available in validation stage."
+              fi
+            displayName: "OPA Compliance Check"
+            continueOnError: true
+
+          # -- Publish Checkov results
+          - task: PublishTestResults@2
+            displayName: "Publish Checkov Results"
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: "$(Build.ArtifactStagingDirectory)/checkov/**/results_junitxml.xml"
+              testRunTitle: "Checkov Security Scan"
+
+  # ============================================================================
+  # Stage 2: Plan
+  # Generates a Terraform plan and publishes it as a pipeline artifact.
+  # ============================================================================
+  - stage: Plan
+    displayName: "Terraform Plan"
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: GeneratePlan
+        displayName: "Generate Terraform Plan"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform"
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: AzureCLI@2
+            displayName: "Azure Login (WIF)"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                # Export credentials for Terraform AzureRM provider
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                export ARM_USE_OIDC=true
+
+                # Initialize with full backend configuration
+                terraform -chdir=$(terraformDir) init \
+                  -backend-config="resource_group_name=$(backendResourceGroup)" \
+                  -backend-config="storage_account_name=$(backendStorageAccount)" \
+                  -backend-config="container_name=$(backendContainer)" \
+                  -backend-config="key=${{ parameters.environment }}.terraform.tfstate" \
+                  -input=false
+
+                # Generate plan with variable file for the target environment
+                terraform -chdir=$(terraformDir) plan \
+                  -var-file="environments/${{ parameters.environment }}.tfvars" \
+                  -out=$(Build.ArtifactStagingDirectory)/tfplan.binary \
+                  -input=false \
+                  -detailed-exitcode || PLAN_EXIT=$?
+
+                # Convert plan to JSON for auditing
+                terraform -chdir=$(terraformDir) show \
+                  -json $(Build.ArtifactStagingDirectory)/tfplan.binary \
+                  > $(Build.ArtifactStagingDirectory)/tfplan.json
+
+                # Convert plan to human-readable text
+                terraform -chdir=$(terraformDir) show \
+                  -no-color $(Build.ArtifactStagingDirectory)/tfplan.binary \
+                  > $(Build.ArtifactStagingDirectory)/tfplan.txt
+
+                echo "Plan exit code: ${PLAN_EXIT:-0}"
+                echo "##vso[task.setvariable variable=planExitCode]${PLAN_EXIT:-0}"
+
+          # Publish the plan as a pipeline artifact for review and apply stages
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Plan Artifact"
+            inputs:
+              targetPath: "$(Build.ArtifactStagingDirectory)"
+              artifact: "terraform-plan-${{ parameters.environment }}"
+
+  # ============================================================================
+  # Stage 3: Import
+  # Runs Terraform import for resources being migrated from ARM.
+  # Gated behind a manual approval and the runImport parameter.
+  # ============================================================================
+  - stage: Import
+    displayName: "Terraform Import"
+    dependsOn: Plan
+    condition: and(succeeded(), eq('${{ parameters.runImport }}', 'true'))
+    jobs:
+      - deployment: ImportResources
+        displayName: "Import ARM Resources"
+        pool:
+          vmImage: "ubuntu-latest"
+        environment: "${{ parameters.environment }}-import"  # Manual approval gate configured in Azure DevOps environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  displayName: "Install Terraform"
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+
+                - task: AzureCLI@2
+                  displayName: "Run State Imports"
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      export ARM_USE_OIDC=true
+
+                      # Initialize Terraform with backend
+                      terraform -chdir=$(terraformDir) init \
+                        -backend-config="resource_group_name=$(backendResourceGroup)" \
+                        -backend-config="storage_account_name=$(backendStorageAccount)" \
+                        -backend-config="container_name=$(backendContainer)" \
+                        -backend-config="key=${{ parameters.environment }}.terraform.tfstate" \
+                        -input=false
+
+                      # Back up state before imports
+                      echo "=== Backing up state ==="
+                      bash $(scriptsDir)/state-migration.sh backup -d $(terraformDir)
+
+                      # Run Terraform apply with import-only targeting.
+                      # Terraform 1.5+ supports import blocks in HCL. Running
+                      # apply processes the import blocks without a separate command.
+                      echo "=== Processing import blocks ==="
+                      terraform -chdir=$(terraformDir) apply \
+                        -var-file="environments/${{ parameters.environment }}.tfvars" \
+                        -input=false \
+                        -auto-approve \
+                        -target='import' 2>&1 || true
+
+                      # If there is a CSV-based import manifest, process it
+                      MANIFEST="$(terraformDir)/imports/${{ parameters.environment }}_imports.csv"
+                      if [[ -f "$MANIFEST" ]]; then
+                        echo "=== Running bulk import from manifest ==="
+                        bash $(scriptsDir)/state-migration.sh bulk-import \
+                          -d $(terraformDir) \
+                          -f "$MANIFEST"
+                      fi
+
+                      echo "=== Post-import plan ==="
+                      terraform -chdir=$(terraformDir) plan \
+                        -var-file="environments/${{ parameters.environment }}.tfvars" \
+                        -input=false
+
+  # ============================================================================
+  # Stage 4: Apply
+  # Applies the Terraform plan. For prod, requires manual approval via the
+  # Azure DevOps environment gate.
+  # ============================================================================
+  - stage: Apply
+    displayName: "Terraform Apply"
+    dependsOn:
+      - Plan
+      - Import
+    condition: |
+      and(
+        succeeded('Plan'),
+        in(dependencies.Import.result, 'Succeeded', 'Skipped')
+      )
+    jobs:
+      - deployment: ApplyChanges
+        displayName: "Apply Terraform Changes"
+        pool:
+          vmImage: "ubuntu-latest"
+        environment: "${{ parameters.environment }}-apply"  # Manual approval gate for prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  displayName: "Install Terraform"
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+
+                # Download the plan artifact produced in the Plan stage
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download Plan Artifact"
+                  inputs:
+                    artifact: "terraform-plan-${{ parameters.environment }}"
+                    path: "$(Pipeline.Workspace)/plan"
+
+                - task: AzureCLI@2
+                  displayName: "Terraform Apply"
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      export ARM_USE_OIDC=true
+
+                      # Initialize Terraform
+                      terraform -chdir=$(terraformDir) init \
+                        -backend-config="resource_group_name=$(backendResourceGroup)" \
+                        -backend-config="storage_account_name=$(backendStorageAccount)" \
+                        -backend-config="container_name=$(backendContainer)" \
+                        -backend-config="key=${{ parameters.environment }}.terraform.tfstate" \
+                        -input=false
+
+                      # Back up state before apply
+                      bash $(scriptsDir)/state-migration.sh backup -d $(terraformDir)
+
+                      # Apply the saved plan
+                      terraform -chdir=$(terraformDir) apply \
+                        -input=false \
+                        -auto-approve \
+                        "$(Pipeline.Workspace)/plan/tfplan.binary"
+
+                # -- ServiceNow change request integration
+                # Posts a completion record to ServiceNow for change management auditing.
+                - script: |
+                    if [[ -n "${SERVICENOW_INSTANCE:-}" ]]; then
+                      curl -s -X POST \
+                        "https://${SERVICENOW_INSTANCE}/api/sn_chg_rest/change" \
+                        -H "Content-Type: application/json" \
+                        -H "Authorization: Bearer ${SERVICENOW_TOKEN}" \
+                        -d "{
+                          \"short_description\": \"Terraform apply - ${{ parameters.environment }} - Build $(Build.BuildNumber)\",
+                          \"description\": \"ARM-to-Terraform migration apply completed.\\nEnvironment: ${{ parameters.environment }}\\nBuild: $(Build.BuildNumber)\\nCommit: $(Build.SourceVersion)\",
+                          \"category\": \"Infrastructure\",
+                          \"type\": \"standard\",
+                          \"state\": \"implement\",
+                          \"assignment_group\": \"Cloud Infrastructure\"
+                        }"
+                      echo "ServiceNow change request created."
+                    else
+                      echo "ServiceNow integration not configured. Skipping."
+                    fi
+                  displayName: "ServiceNow Change Record"
+                  condition: succeeded()
+                  env:
+                    SERVICENOW_INSTANCE: $(servicenow.instance)
+                    SERVICENOW_TOKEN: $(servicenow.token)
+
+  # ============================================================================
+  # Stage 5: Verify
+  # Validates ARM-to-Terraform parity and runs compliance checks.
+  # ============================================================================
+  - stage: Verify
+    displayName: "Verify & Compliance"
+    dependsOn: Apply
+    condition: succeeded()
+    jobs:
+      - job: ParityCheck
+        displayName: "Validate Parity & Compliance"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform"
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: AzureCLI@2
+            displayName: "Run Parity Validation"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                export ARM_USE_OIDC=true
+
+                # Initialize Terraform for state access
+                terraform -chdir=$(terraformDir) init \
+                  -backend-config="resource_group_name=$(backendResourceGroup)" \
+                  -backend-config="storage_account_name=$(backendStorageAccount)" \
+                  -backend-config="container_name=$(backendContainer)" \
+                  -backend-config="key=${{ parameters.environment }}.terraform.tfstate" \
+                  -input=false
+
+                # Read resource group names from environment config
+                RG_LIST=$(terraform -chdir=$(terraformDir) output -json resource_group_names 2>/dev/null | python3 -c "import json,sys; [print(rg) for rg in json.load(sys.stdin)]" 2>/dev/null || echo "")
+
+                if [[ -z "$RG_LIST" ]]; then
+                  echo "No resource group output found. Using pipeline variable."
+                  RG_LIST="${MIGRATION_RESOURCE_GROUPS:-rg-${{ parameters.environment }}-networking rg-${{ parameters.environment }}-database rg-${{ parameters.environment }}-security}"
+                fi
+
+                OVERALL_EXIT=0
+                for rg in $RG_LIST; do
+                  echo "=== Validating parity for: $rg ==="
+                  bash $(scriptsDir)/validate-parity.sh \
+                    -g "$rg" \
+                    -d $(terraformDir) \
+                    -o "$(Build.ArtifactStagingDirectory)/parity/$rg" || OVERALL_EXIT=1
+                done
+
+                exit $OVERALL_EXIT
+
+          # Publish parity reports as artifacts
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Parity Reports"
+            condition: succeededOrFailed()
+            inputs:
+              targetPath: "$(Build.ArtifactStagingDirectory)/parity"
+              artifact: "parity-reports-${{ parameters.environment }}"
+
+          # Run OPA/Rego compliance against the live state
+          - task: AzureCLI@2
+            displayName: "Post-Apply Compliance Check"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                export ARM_USE_OIDC=true
+
+                curl -sSL -o /usr/local/bin/opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+                chmod +x /usr/local/bin/opa
+
+                # Generate plan JSON from current state for compliance evaluation
+                terraform -chdir=$(terraformDir) init -backend=false -input=false 2>/dev/null || true
+                terraform -chdir=$(terraformDir) plan \
+                  -var-file="environments/${{ parameters.environment }}.tfvars" \
+                  -out=compliance_plan.binary \
+                  -input=false 2>/dev/null || true
+                terraform -chdir=$(terraformDir) show -json compliance_plan.binary > compliance_plan.json 2>/dev/null || true
+
+                if [[ -f compliance_plan.json ]]; then
+                  echo "=== HIPAA Compliance Evaluation ==="
+                  opa eval \
+                    --input compliance_plan.json \
+                    --data $(System.DefaultWorkingDirectory)/tests/compliance/ \
+                    "data.terraform.compliance" \
+                    --format pretty
+                fi

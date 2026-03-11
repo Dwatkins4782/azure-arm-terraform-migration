@@ -1,0 +1,415 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environment": {
+      "type": "string",
+      "allowedValues": ["dev", "staging", "prod"],
+      "metadata": {
+        "description": "Environment name for resource naming"
+      }
+    },
+    "vnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.0.0/16",
+      "metadata": {
+        "description": "Address prefix for the Virtual Network"
+      }
+    },
+    "appSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.1.0/24"
+    },
+    "dataSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.2.0/24"
+    },
+    "aksSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.4.0/22"
+    },
+    "bastionSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.3.0/27"
+    },
+    "privateEndpointSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.8.0/24"
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    }
+  },
+  "variables": {
+    "vnetName": "[concat('vnet-healthcare-', parameters('environment'))]",
+    "nsgAppName": "[concat('nsg-app-', parameters('environment'))]",
+    "nsgDataName": "[concat('nsg-data-', parameters('environment'))]",
+    "nsgAksName": "[concat('nsg-aks-', parameters('environment'))]",
+    "nsgPeName": "[concat('nsg-pe-', parameters('environment'))]",
+    "routeTableName": "[concat('rt-default-', parameters('environment'))]",
+    "bastionName": "[concat('bastion-', parameters('environment'))]",
+    "bastionPipName": "[concat('pip-bastion-', parameters('environment'))]",
+    "logAnalyticsId": "[resourceId('Microsoft.OperationalInsights/workspaces', concat('law-healthcare-', parameters('environment')))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('nsgAppName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa",
+        "managed-by": "arm-template"
+      },
+      "properties": {
+        "securityRules": [
+          {
+            "name": "AllowHTTPS",
+            "properties": {
+              "priority": 100,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "DenyAllInbound",
+            "properties": {
+              "priority": 4096,
+              "direction": "Inbound",
+              "access": "Deny",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('nsgDataName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa",
+        "managed-by": "arm-template"
+      },
+      "properties": {
+        "securityRules": [
+          {
+            "name": "AllowSQLFromApp",
+            "properties": {
+              "priority": 100,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "1433",
+              "sourceAddressPrefix": "[parameters('appSubnetPrefix')]",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "AllowSQLFromAKS",
+            "properties": {
+              "priority": 110,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "1433",
+              "sourceAddressPrefix": "[parameters('aksSubnetPrefix')]",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "DenyAllInbound",
+            "properties": {
+              "priority": 4096,
+              "direction": "Inbound",
+              "access": "Deny",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('nsgAksName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa",
+        "managed-by": "arm-template"
+      },
+      "properties": {
+        "securityRules": [
+          {
+            "name": "AllowHTTPSInbound",
+            "properties": {
+              "priority": 100,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefix": "[parameters('appSubnetPrefix')]",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "AllowKubeletInbound",
+            "properties": {
+              "priority": 110,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "10250",
+              "sourceAddressPrefix": "VirtualNetwork",
+              "destinationAddressPrefix": "*"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('nsgPeName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa",
+        "managed-by": "arm-template"
+      },
+      "properties": {
+        "securityRules": [
+          {
+            "name": "DenyAllInbound",
+            "properties": {
+              "priority": 4096,
+              "direction": "Inbound",
+              "access": "Deny",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/routeTables",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('routeTableName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa"
+      },
+      "properties": {
+        "disableBgpRoutePropagation": false,
+        "routes": [
+          {
+            "name": "route-to-firewall",
+            "properties": {
+              "addressPrefix": "0.0.0.0/0",
+              "nextHopType": "VirtualAppliance",
+              "nextHopIpAddress": "10.0.100.4"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgAppName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgDataName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgAksName'))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgPeName'))]",
+        "[resourceId('Microsoft.Network/routeTables', variables('routeTableName'))]"
+      ],
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa",
+        "managed-by": "arm-template"
+      },
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "[parameters('vnetAddressPrefix')]"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "snet-app",
+            "properties": {
+              "addressPrefix": "[parameters('appSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgAppName'))]"
+              },
+              "routeTable": {
+                "id": "[resourceId('Microsoft.Network/routeTables', variables('routeTableName'))]"
+              },
+              "privateEndpointNetworkPolicies": "Enabled",
+              "serviceEndpoints": [
+                { "service": "Microsoft.Sql" },
+                { "service": "Microsoft.KeyVault" },
+                { "service": "Microsoft.Storage" }
+              ]
+            }
+          },
+          {
+            "name": "snet-data",
+            "properties": {
+              "addressPrefix": "[parameters('dataSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgDataName'))]"
+              },
+              "routeTable": {
+                "id": "[resourceId('Microsoft.Network/routeTables', variables('routeTableName'))]"
+              },
+              "privateEndpointNetworkPolicies": "Disabled"
+            }
+          },
+          {
+            "name": "AzureBastionSubnet",
+            "properties": {
+              "addressPrefix": "[parameters('bastionSubnetPrefix')]"
+            }
+          },
+          {
+            "name": "snet-aks",
+            "properties": {
+              "addressPrefix": "[parameters('aksSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgAksName'))]"
+              },
+              "routeTable": {
+                "id": "[resourceId('Microsoft.Network/routeTables', variables('routeTableName'))]"
+              }
+            }
+          },
+          {
+            "name": "snet-private-endpoints",
+            "properties": {
+              "addressPrefix": "[parameters('privateEndpointSubnetPrefix')]",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgPeName'))]"
+              },
+              "privateEndpointNetworkPolicies": "Disabled"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('bastionPipName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static"
+      }
+    },
+    {
+      "type": "Microsoft.Network/bastionHosts",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('bastionName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('bastionPipName'))]"
+      ],
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "bastion-ip-config",
+            "properties": {
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('bastionPipName'))]"
+              },
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), 'AzureBastionSubnet')]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks/providers/diagnosticSettings",
+      "apiVersion": "2021-05-01-preview",
+      "name": "[concat(variables('vnetName'), '/Microsoft.Insights/diagSettings')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+      ],
+      "properties": {
+        "workspaceId": "[variables('logAnalyticsId')]",
+        "logs": [
+          {
+            "category": "VMProtectionAlerts",
+            "enabled": true
+          }
+        ],
+        "metrics": [
+          {
+            "category": "AllMetrics",
+            "enabled": true
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "vnetId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+    },
+    "appSubnetId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), 'snet-app')]"
+    },
+    "dataSubnetId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), 'snet-data')]"
+    },
+    "aksSubnetId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), 'snet-aks')]"
+    },
+    "privateEndpointSubnetId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), 'snet-private-endpoints')]"
+    }
+  }
+}

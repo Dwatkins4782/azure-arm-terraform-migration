@@ -1,0 +1,213 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environment": {
+      "type": "string",
+      "allowedValues": ["dev", "staging", "prod"]
+    },
+    "aksVersion": {
+      "type": "string",
+      "defaultValue": "1.28.5"
+    },
+    "aksNodeCount": {
+      "type": "int",
+      "defaultValue": 3,
+      "minValue": 1,
+      "maxValue": 50
+    },
+    "aksNodeVmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D4s_v5"
+    },
+    "aksSubnetId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the AKS subnet"
+      }
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string"
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    }
+  },
+  "variables": {
+    "aksName": "[concat('aks-healthcare-', parameters('environment'))]",
+    "acrName": "[concat('acrhealthcare', parameters('environment'))]",
+    "aksIdentityName": "[concat('id-aks-', parameters('environment'))]",
+    "aksPrivateDnsZoneName": "[concat('privatelink.', parameters('location'), '.azmk8s.io')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[variables('aksIdentityName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa"
+      }
+    },
+    {
+      "type": "Microsoft.ContainerRegistry/registries",
+      "apiVersion": "2023-07-01",
+      "name": "[variables('acrName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Premium"
+      },
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa"
+      },
+      "properties": {
+        "adminUserEnabled": false,
+        "publicNetworkAccess": "Disabled",
+        "networkRuleBypassOptions": "AzureServices",
+        "encryption": {
+          "status": "enabled"
+        },
+        "policies": {
+          "retentionPolicy": {
+            "days": 90,
+            "status": "enabled"
+          },
+          "trustPolicy": {
+            "type": "Notary",
+            "status": "enabled"
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.ContainerService/managedClusters",
+      "apiVersion": "2024-01-01",
+      "name": "[variables('aksName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('aksIdentityName'))]"
+      ],
+      "tags": {
+        "environment": "[parameters('environment')]",
+        "compliance": "hipaa",
+        "managed-by": "arm-template"
+      },
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('aksIdentityName'))]": {}
+        }
+      },
+      "sku": {
+        "name": "Standard",
+        "tier": "Standard"
+      },
+      "properties": {
+        "kubernetesVersion": "[parameters('aksVersion')]",
+        "dnsPrefix": "[concat('aks-healthcare-', parameters('environment'))]",
+        "enableRBAC": true,
+        "aadProfile": {
+          "managed": true,
+          "enableAzureRBAC": true
+        },
+        "networkProfile": {
+          "networkPlugin": "azure",
+          "networkPolicy": "calico",
+          "serviceCidr": "172.16.0.0/16",
+          "dnsServiceIP": "172.16.0.10",
+          "loadBalancerSku": "standard",
+          "outboundType": "userDefinedRouting"
+        },
+        "agentPoolProfiles": [
+          {
+            "name": "system",
+            "count": "[parameters('aksNodeCount')]",
+            "vmSize": "[parameters('aksNodeVmSize')]",
+            "osType": "Linux",
+            "osDiskSizeGB": 128,
+            "osDiskType": "Ephemeral",
+            "vnetSubnetID": "[parameters('aksSubnetId')]",
+            "mode": "System",
+            "enableAutoScaling": true,
+            "minCount": 2,
+            "maxCount": 5,
+            "availabilityZones": ["1", "2", "3"],
+            "enableEncryptionAtHost": true,
+            "nodeTaints": ["CriticalAddonsOnly=true:NoSchedule"]
+          },
+          {
+            "name": "apppool",
+            "count": "[parameters('aksNodeCount')]",
+            "vmSize": "[parameters('aksNodeVmSize')]",
+            "osType": "Linux",
+            "osDiskSizeGB": 128,
+            "osDiskType": "Ephemeral",
+            "vnetSubnetID": "[parameters('aksSubnetId')]",
+            "mode": "User",
+            "enableAutoScaling": true,
+            "minCount": 2,
+            "maxCount": 20,
+            "availabilityZones": ["1", "2", "3"],
+            "enableEncryptionAtHost": true
+          }
+        ],
+        "apiServerAccessProfile": {
+          "enablePrivateCluster": true,
+          "privateDNSZone": "system"
+        },
+        "addonProfiles": {
+          "omsagent": {
+            "enabled": true,
+            "config": {
+              "logAnalyticsWorkspaceResourceID": "[parameters('logAnalyticsWorkspaceId')]"
+            }
+          },
+          "azurepolicy": {
+            "enabled": true
+          },
+          "azureKeyvaultSecretsProvider": {
+            "enabled": true,
+            "config": {
+              "enableSecretRotation": "true",
+              "rotationPollInterval": "2m"
+            }
+          }
+        },
+        "autoUpgradeProfile": {
+          "upgradeChannel": "stable"
+        },
+        "oidcIssuerProfile": {
+          "enabled": true
+        },
+        "securityProfile": {
+          "workloadIdentity": {
+            "enabled": true
+          },
+          "defender": {
+            "securityMonitoring": {
+              "enabled": true
+            },
+            "logAnalyticsWorkspaceResourceId": "[parameters('logAnalyticsWorkspaceId')]"
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "aksId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.ContainerService/managedClusters', variables('aksName'))]"
+    },
+    "acrId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]"
+    },
+    "aksIdentityPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('aksIdentityName'))).principalId]"
+    }
+  }
+}
