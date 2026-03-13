@@ -71,19 +71,29 @@ azure-arm-terraform-migration/
 ├── scripts/
 │   ├── aztfexport-wrapper.sh        # Enterprise aztfexport automation
 │   ├── validate-parity.sh           # ARM vs Terraform parity validation
-│   └── state-migration.sh           # Safe state import/move operations
+│   ├── state-migration.sh           # Safe state import/move operations
+│   └── check-critical-resources.sh  # Pipeline safety gate script
+│
+├── kubernetes/
+│   └── argocd/
+│       └── applicationset.yaml      # ArgoCD multi-env app generation
 │
 ├── pipelines/
-│   ├── azure-pipelines.yml          # Multi-stage CI/CD pipeline
-│   └── .tflint.hcl                  # Linting configuration
+│   ├── azure-pipelines.yml              # Multi-stage CI/CD pipeline
+│   ├── azure-pipelines-with-gates.yml   # Pipeline with critical resource protection
+│   ├── argocd-feature-deploy.yml        # ArgoCD deploy for non-main branches
+│   ├── argocd-cleanup-ephemeral.yml     # Ephemeral namespace cleanup
+│   └── .tflint.hcl                      # Linting configuration
 │
 ├── tests/compliance/
 │   └── hipaa_policy.rego            # OPA policy for HIPAA enforcement
 │
 └── docs/
-    ├── MIGRATION-GUIDE.md           # Step-by-step conversion guide
-    ├── ARCHITECTURE.md              # Technical architecture decisions
-    └── COMPLIANCE.md                # HIPAA compliance mapping
+    ├── MIGRATION-GUIDE.md                  # Step-by-step conversion guide
+    ├── ARCHITECTURE.md                     # Technical architecture decisions
+    ├── COMPLIANCE.md                       # HIPAA compliance mapping
+    ├── RBAC-MIGRATION-INCIDENT-ANALYSIS.md # Key Vault RBAC cascade RCA
+    └── INTERVIEW-PREP-TERRAFORM-CONSULTANT.md # Interview preparation
 ```
 
 ## Key Skills Demonstrated
@@ -100,6 +110,9 @@ azure-arm-terraform-migration/
 | Event-Driven Patterns | Azure Event Grid → Azure Function pipeline for CMDB sync and compliance monitoring |
 | Healthcare Compliance | HIPAA controls: encryption at rest/transit, audit logging, PHI access monitoring, OPA policies |
 | CI/CD | Azure DevOps multi-stage pipeline with approval gates, compliance scanning, and ServiceNow integration |
+| ArgoCD GitOps | ApplicationSets for multi-env deployment, feature branch ephemeral environments, automated cleanup |
+| Pipeline Safety Gates | Critical resource protection — automated detection of cascade-destructive Terraform changes |
+| Incident Response | Root cause analysis documentation for Key Vault RBAC migration cascade incident |
 
 ## Quick Start
 
@@ -140,6 +153,39 @@ Push to `main` branch to trigger the Azure DevOps pipeline, which will:
 4. Wait for approval
 5. Apply changes
 6. Verify parity and compliance
+
+## Documentation
+
+| Guide | Description |
+|-------|-------------|
+| [Migration Guide](docs/MIGRATION-GUIDE.md) | Step-by-step ARM-to-Terraform conversion process |
+| [Architecture Decisions](docs/ARCHITECTURE.md) | State management, layer isolation, authentication |
+| [Compliance](docs/COMPLIANCE.md) | HIPAA controls and compliance mapping |
+| [RBAC Migration Incident Analysis](docs/RBAC-MIGRATION-INCIDENT-ANALYSIS.md) | Root cause analysis of Key Vault RBAC cascade that destroyed 50+ AKS clusters, with prevention strategy |
+| [Interview Prep](docs/INTERVIEW-PREP-TERRAFORM-CONSULTANT.md) | Terraform consultant interview preparation |
+
+## CI/CD Pipelines
+
+| Pipeline | Trigger | Purpose |
+|----------|---------|---------|
+| [azure-pipelines.yml](pipelines/azure-pipelines.yml) | Push to `main` | Standard Terraform validate → plan → import → apply → verify |
+| [azure-pipelines-with-gates.yml](pipelines/azure-pipelines-with-gates.yml) | Push to `main` | Enhanced pipeline with critical resource protection gates |
+| [argocd-feature-deploy.yml](pipelines/argocd-feature-deploy.yml) | Push to any non-main branch | ArgoCD deployment for feature/hotfix/release branches |
+| [argocd-cleanup-ephemeral.yml](pipelines/argocd-cleanup-ephemeral.yml) | Daily schedule (2 AM) | Cleans up ephemeral namespaces from deleted branches |
+
+### ArgoCD Feature Branch Flow
+
+```
+feature/my-feature branch  ──→  Build Image  ──→  Push to ACR
+                                                        │
+                                               ArgoCD Application created
+                                               in dev cluster (ephemeral NS)
+                                                        │
+                                               Auto-sync from Git ──→ Deploy
+                                                        │
+                                               Branch deleted ──→ Cleanup pipeline
+                                               removes namespace + ArgoCD app
+```
 
 ## Conversion Methodology
 

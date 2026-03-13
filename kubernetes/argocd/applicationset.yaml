@@ -1,0 +1,191 @@
+# =============================================================================
+# ArgoCD ApplicationSet — Multi-Environment Auto-Generation
+#
+# PURPOSE:
+#   Automatically creates ArgoCD Application CRDs for each environment.
+#   Instead of manually creating separate Application manifests for dev,
+#   staging, and prod, this single template generates all three.
+#
+# HOW IT WORKS:
+#   The List generator provides a set of parameters (environment name,
+#   cluster URL, branch, namespace). The template section uses those
+#   parameters to create one Application per entry.
+#
+# NON-MAIN BRANCH HANDLING:
+#   Feature branches are handled by the argocd-feature-deploy.yml pipeline,
+#   which dynamically creates Application CRDs. This ApplicationSet handles
+#   the persistent environments (dev, staging, prod).
+#
+# SYNC POLICIES:
+#   - Dev: Automated sync with self-heal (fast iteration)
+#   - Staging: Automated sync, no self-heal (controlled testing)
+#   - Prod: Manual sync only (requires explicit approval)
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: platform-apps
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          # -----------------------------------------------------------------
+          # DEV — Automated sync, self-heal ON
+          # Tracks the 'develop' branch
+          # -----------------------------------------------------------------
+          - environment: dev
+            cluster: aks-platform-dev
+            clusterUrl: https://aks-platform-dev.eastus.azmk8s.io:443
+            branch: develop
+            namespace: dev
+            syncPolicy: automated
+            selfHeal: "true"
+            prune: "true"
+            kustomizePath: kubernetes/overlays/dev
+
+          # -----------------------------------------------------------------
+          # STAGING — Automated sync, self-heal OFF
+          # Tracks the 'staging' branch
+          # -----------------------------------------------------------------
+          - environment: staging
+            cluster: aks-platform-staging
+            clusterUrl: https://aks-platform-staging.eastus.azmk8s.io:443
+            branch: staging
+            namespace: staging
+            syncPolicy: automated
+            selfHeal: "false"
+            prune: "true"
+            kustomizePath: kubernetes/overlays/staging
+
+          # -----------------------------------------------------------------
+          # PROD — Manual sync only, self-heal OFF
+          # Tracks the 'main' branch
+          # -----------------------------------------------------------------
+          - environment: prod
+            cluster: aks-platform-prod
+            clusterUrl: https://aks-platform-prod.eastus.azmk8s.io:443
+            branch: main
+            namespace: prod
+            syncPolicy: manual
+            selfHeal: "false"
+            prune: "false"
+            kustomizePath: kubernetes/overlays/prod
+
+  template:
+    metadata:
+      name: "platform-{{environment}}"
+      namespace: argocd
+      labels:
+        platform.io/environment: "{{environment}}"
+        platform.io/managed-by: applicationset
+      annotations:
+        platform.io/cluster: "{{cluster}}"
+    spec:
+      project: platform-apps
+      source:
+        repoURL: https://dev.azure.com/org/project/_git/azure-arm-terraform-migration
+        targetRevision: "{{branch}}"
+        path: "{{kustomizePath}}"
+      destination:
+        server: "{{clusterUrl}}"
+        namespace: "{{namespace}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 5m
+
+---
+# =============================================================================
+# ArgoCD AppProject — Security Boundary
+#
+# Defines what resources the platform-apps project can access,
+# what clusters and namespaces it can deploy to, and what K8s
+# resource types are allowed.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform-apps
+  namespace: argocd
+spec:
+  description: "Platform applications — multi-environment deployment"
+
+  # Source repositories allowed
+  sourceRepos:
+    - https://dev.azure.com/org/project/_git/azure-arm-terraform-migration
+    - https://dev.azure.com/org/project/_git/*
+
+  # Allowed destinations (clusters + namespaces)
+  destinations:
+    # Dev cluster — allow all namespaces (for feature branches)
+    - server: https://aks-platform-dev.eastus.azmk8s.io:443
+      namespace: "*"
+    # Staging cluster — restricted namespaces
+    - server: https://aks-platform-staging.eastus.azmk8s.io:443
+      namespace: staging
+    - server: https://aks-platform-staging.eastus.azmk8s.io:443
+      namespace: "hotfix-*"
+    - server: https://aks-platform-staging.eastus.azmk8s.io:443
+      namespace: "release-*"
+    # Prod cluster — only prod namespace
+    - server: https://aks-platform-prod.eastus.azmk8s.io:443
+      namespace: prod
+
+  # Allowed Kubernetes resource types
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: "*"
+    - group: apps
+      kind: "*"
+    - group: batch
+      kind: "*"
+    - group: networking.k8s.io
+      kind: "*"
+    - group: policy
+      kind: "*"
+    - group: autoscaling
+      kind: "*"
+
+  # RBAC roles for the project
+  roles:
+    - name: admin
+      description: "Full access to platform-apps project"
+      policies:
+        - p, proj:platform-apps:admin, applications, *, platform-apps/*, allow
+      groups:
+        - platform-admins
+
+    - name: developer
+      description: "View and sync access"
+      policies:
+        - p, proj:platform-apps:developer, applications, get, platform-apps/*, allow
+        - p, proj:platform-apps:developer, applications, sync, platform-apps/*, allow
+      groups:
+        - platform-developers
+
+    - name: viewer
+      description: "Read-only access"
+      policies:
+        - p, proj:platform-apps:viewer, applications, get, platform-apps/*, allow
+      groups:
+        - platform-viewers

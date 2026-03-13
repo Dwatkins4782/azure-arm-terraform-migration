@@ -1,0 +1,575 @@
+# =============================================================================
+# Azure DevOps CI/CD Pipeline — With Critical Resource Protection Gates
+#
+# PURPOSE:
+#   This pipeline prevents the catastrophic cascade destruction that occurs when
+#   immutable Azure resource properties (like Key Vault RBAC authorization) are
+#   changed via Terraform. It implements THREE tiers of protection:
+#
+#   Tier 1: Terraform lifecycle blocks (prevent_destroy) — in HCL code
+#   Tier 2: Critical resource detection — automated plan analysis (this pipeline)
+#   Tier 3: Manual approval gate — human review for destructive changes
+#
+# STAGES:
+#   1. Validate   — Lint, format check, security scan
+#   2. Plan       — Generate plan, export as JSON, count destructive ops
+#   3. CritCheck  — Analyze plan JSON for critical resource destruction
+#   4. Approval   — Manual approval (only if destructive changes detected)
+#   5. AutoApprove— Auto-proceed (only if NO destructive changes detected)
+#   6. Apply      — Apply the Terraform plan
+#   7. Verify     — Parity validation and compliance checks
+#
+# INCIDENT CONTEXT:
+#   See docs/RBAC-MIGRATION-INCIDENT-ANALYSIS.md for the full root cause
+#   analysis of the Key Vault RBAC migration cascade that destroyed 50+ AKS
+#   clusters. This pipeline was designed to prevent that class of incident.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+      - scripts/**
+      - pipelines/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+
+variables:
+  terraformVersion: "1.7.5"
+  azureServiceConnection: "azure-arm-migration-wif"
+  backendResourceGroup: "rg-terraform-state"
+  backendStorageAccount: "stterraformstate"
+  backendContainer: "tfstate"
+  terraformDir: "$(System.DefaultWorkingDirectory)/terraform"
+  scriptsDir: "$(System.DefaultWorkingDirectory)/scripts"
+
+parameters:
+  - name: environment
+    displayName: "Target environment"
+    type: string
+    default: dev
+    values:
+      - dev
+      - staging
+      - prod
+
+  - name: forceApply
+    displayName: "Force apply (bypass critical resource check) — DANGEROUS"
+    type: boolean
+    default: false
+
+# =============================================================================
+# Stage 1: Validate
+# =============================================================================
+stages:
+  - stage: Validate
+    displayName: "Validate Terraform"
+    jobs:
+      - job: LintAndScan
+        displayName: "Lint, Validate & Security Scan"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform $(terraformVersion)"
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: AzureCLI@2
+            displayName: "Azure Login (WIF)"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                echo "Authenticated via workload identity federation."
+                az account show --output table
+
+          - script: |
+              echo "=== terraform fmt -check ==="
+              terraform -chdir=$(terraformDir) fmt -check -recursive -diff
+            displayName: "Terraform Format Check"
+
+          - script: |
+              terraform -chdir=$(terraformDir) init \
+                -backend=false \
+                -input=false
+            displayName: "Terraform Init (validation only)"
+
+          - script: |
+              terraform -chdir=$(terraformDir) validate
+            displayName: "Terraform Validate"
+
+          - script: |
+              pip install checkov --quiet
+              checkov \
+                --directory $(terraformDir) \
+                --framework terraform \
+                --output cli \
+                --soft-fail
+            displayName: "Checkov Security Scan"
+
+  # =============================================================================
+  # Stage 2: Plan
+  #
+  # Generates the Terraform plan and exports it in THREE formats:
+  #   1. Binary plan file (for apply)
+  #   2. JSON plan file (for automated analysis by CritCheck stage)
+  #   3. Human-readable text (for manual review)
+  #
+  # Also counts destructive operations and sets pipeline variables that
+  # downstream stages use to decide whether to gate or auto-approve.
+  # =============================================================================
+  - stage: Plan
+    displayName: "Terraform Plan"
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: GeneratePlan
+        displayName: "Generate Terraform Plan"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform"
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: AzureCLI@2
+            displayName: "Generate and Analyze Plan"
+            name: planStep
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                export ARM_USE_OIDC=true
+
+                # Initialize with backend
+                terraform -chdir=$(terraformDir) init \
+                  -backend-config="resource_group_name=$(backendResourceGroup)" \
+                  -backend-config="storage_account_name=$(backendStorageAccount)" \
+                  -backend-config="container_name=$(backendContainer)" \
+                  -backend-config="key=${{ parameters.environment }}.terraform.tfstate" \
+                  -input=false
+
+                # Generate plan (binary)
+                terraform -chdir=$(terraformDir) plan \
+                  -var-file="environments/${{ parameters.environment }}.tfvars" \
+                  -out=$(Build.ArtifactStagingDirectory)/tfplan.binary \
+                  -input=false || true
+
+                # Convert to JSON (for CritCheck stage)
+                terraform -chdir=$(terraformDir) show \
+                  -json $(Build.ArtifactStagingDirectory)/tfplan.binary \
+                  > $(Build.ArtifactStagingDirectory)/tfplan.json
+
+                # Convert to human-readable text (for review)
+                terraform -chdir=$(terraformDir) show \
+                  -no-color $(Build.ArtifactStagingDirectory)/tfplan.binary \
+                  > $(Build.ArtifactStagingDirectory)/tfplan.txt
+
+                # ---------------------------------------------------------------
+                # Count destructive operations from plan JSON
+                # ---------------------------------------------------------------
+                DESTROY_COUNT=$(jq '[.resource_changes[] | select(.change.actions | contains(["delete"]))] | length' \
+                  $(Build.ArtifactStagingDirectory)/tfplan.json)
+
+                REPLACE_COUNT=$(jq '[.resource_changes[] | select(.change.actions == ["delete","create"])] | length' \
+                  $(Build.ArtifactStagingDirectory)/tfplan.json)
+
+                CREATE_COUNT=$(jq '[.resource_changes[] | select(.change.actions == ["create"])] | length' \
+                  $(Build.ArtifactStagingDirectory)/tfplan.json)
+
+                UPDATE_COUNT=$(jq '[.resource_changes[] | select(.change.actions == ["update"])] | length' \
+                  $(Build.ArtifactStagingDirectory)/tfplan.json)
+
+                TOTAL_CHANGES=$((DESTROY_COUNT + REPLACE_COUNT + CREATE_COUNT + UPDATE_COUNT))
+
+                echo ""
+                echo "═══════════════════════════════════════════════════════"
+                echo "  PLAN SUMMARY"
+                echo "═══════════════════════════════════════════════════════"
+                echo "  Create:  ${CREATE_COUNT}"
+                echo "  Update:  ${UPDATE_COUNT}"
+                echo "  Replace: ${REPLACE_COUNT} (destroy + create)"
+                echo "  Destroy: ${DESTROY_COUNT}"
+                echo "  Total:   ${TOTAL_CHANGES}"
+                echo "═══════════════════════════════════════════════════════"
+                echo ""
+
+                # Set output variables for downstream stages
+                echo "##vso[task.setvariable variable=destroyCount;isOutput=true]${DESTROY_COUNT}"
+                echo "##vso[task.setvariable variable=replaceCount;isOutput=true]${REPLACE_COUNT}"
+                echo "##vso[task.setvariable variable=totalChanges;isOutput=true]${TOTAL_CHANGES}"
+                echo "##vso[task.setvariable variable=hasDestructiveChanges;isOutput=true]$([ $((DESTROY_COUNT + REPLACE_COUNT)) -gt 0 ] && echo true || echo false)"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Plan Artifact"
+            inputs:
+              targetPath: "$(Build.ArtifactStagingDirectory)"
+              artifact: "terraform-plan-${{ parameters.environment }}"
+
+  # =============================================================================
+  # Stage 3: Critical Resource Check
+  #
+  # This is the automated safety gate. It analyzes the plan JSON for any
+  # destructive operations on CRITICAL resource types:
+  #   - azurerm_key_vault (the cascade trigger)
+  #   - azurerm_kubernetes_cluster (AKS clusters)
+  #   - azurerm_kubernetes_cluster_node_pool (node pools)
+  #   - azurerm_disk_encryption_set (encryption references)
+  #   - azurerm_key_vault_key (encryption keys)
+  #   - azurerm_mssql_server (databases)
+  #   - azurerm_cosmosdb_account (databases)
+  #   - azurerm_storage_account (storage)
+  #
+  # If ANY critical resource would be destroyed or replaced, this stage
+  # FAILS — blocking the pipeline from proceeding to apply.
+  # =============================================================================
+  - stage: CriticalCheck
+    displayName: "Critical Resource Check"
+    dependsOn: Plan
+    condition: succeeded()
+    jobs:
+      - job: CheckCriticalResources
+        displayName: "Analyze Plan for Critical Resources"
+        pool:
+          vmImage: "ubuntu-latest"
+        variables:
+          destroyCount: $[ stageDependencies.Plan.GeneratePlan.outputs['planStep.destroyCount'] ]
+          replaceCount: $[ stageDependencies.Plan.GeneratePlan.outputs['planStep.replaceCount'] ]
+          hasDestructiveChanges: $[ stageDependencies.Plan.GeneratePlan.outputs['planStep.hasDestructiveChanges'] ]
+        steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Plan Artifact"
+            inputs:
+              artifact: "terraform-plan-${{ parameters.environment }}"
+              path: "$(Pipeline.Workspace)/plan"
+
+          - script: |
+              set -euo pipefail
+              echo "=== Critical Resource Protection Check ==="
+              echo ""
+              echo "Destructive changes detected: $(hasDestructiveChanges)"
+              echo "Destroy count: $(destroyCount)"
+              echo "Replace count: $(replaceCount)"
+              echo ""
+
+              # Run the critical resource check script
+              bash $(scriptsDir)/check-critical-resources.sh \
+                "$(Pipeline.Workspace)/plan/tfplan.json"
+            displayName: "Check for Critical Resource Destruction"
+            name: critCheck
+
+          - script: |
+              echo ""
+              echo "═══════════════════════════════════════════════════════════════"
+              echo "  Plan Review Summary for ${{ parameters.environment }}"
+              echo "═══════════════════════════════════════════════════════════════"
+              echo ""
+              echo "  Resources to DESTROY: $(destroyCount)"
+              echo "  Resources to REPLACE: $(replaceCount)"
+              echo ""
+
+              if [ "$(hasDestructiveChanges)" = "true" ]; then
+                echo "  ⚠️  DESTRUCTIVE CHANGES DETECTED"
+                echo "  Manual approval will be required before apply."
+                echo ""
+                echo "  Affected resources:"
+                jq -r '
+                  .resource_changes[]
+                  | select(.change.actions | contains(["delete"]))
+                  | "    → \(.address) (\(.change.actions | join(", ")))"
+                ' "$(Pipeline.Workspace)/plan/tfplan.json"
+              else
+                echo "  ✅ No destructive changes. Auto-approval eligible."
+              fi
+              echo ""
+              echo "═══════════════════════════════════════════════════════════════"
+            displayName: "Print Plan Summary"
+            condition: always()
+
+  # =============================================================================
+  # Stage 4: Manual Approval (destructive changes)
+  #
+  # This stage only runs when destructive changes are detected.
+  # It uses Azure DevOps environment approvals, which require a human to
+  # click "Approve" in the Azure DevOps UI before the pipeline continues.
+  #
+  # The environment must be configured in Azure DevOps with:
+  #   - Required approvers (e.g., lead engineer, SRE team)
+  #   - Approval timeout (e.g., 24 hours)
+  #   - Instructions showing the plan summary
+  # =============================================================================
+  - stage: ManualApproval
+    displayName: "Manual Approval Required"
+    dependsOn:
+      - Plan
+      - CriticalCheck
+    condition: |
+      and(
+        succeeded('CriticalCheck'),
+        eq(stageDependencies.Plan.GeneratePlan.outputs['planStep.hasDestructiveChanges'], 'true'),
+        ne('${{ parameters.forceApply }}', 'true')
+      )
+    jobs:
+      - deployment: ApproveDestructiveChanges
+        displayName: "Review and Approve Destructive Changes"
+        pool:
+          vmImage: "ubuntu-latest"
+        environment: "${{ parameters.environment }}-critical-approval"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    echo "═══════════════════════════════════════════════════════════"
+                    echo "  MANUAL APPROVAL GRANTED"
+                    echo "  Environment: ${{ parameters.environment }}"
+                    echo "  Approved by: $(Build.RequestedFor)"
+                    echo "  Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                    echo "═══════════════════════════════════════════════════════════"
+                  displayName: "Log Approval"
+
+  # =============================================================================
+  # Stage 5: Auto-Approve (non-destructive changes only)
+  #
+  # When a plan has NO destructive changes (only creates/updates), this
+  # stage runs instead of ManualApproval. It skips the approval gate and
+  # allows the pipeline to proceed directly to Apply.
+  #
+  # This ensures that safe changes (like updating a tag or adding a new
+  # resource) don't require human intervention.
+  # =============================================================================
+  - stage: AutoApprove
+    displayName: "Auto-Approve (Non-Destructive)"
+    dependsOn:
+      - Plan
+      - CriticalCheck
+    condition: |
+      and(
+        succeeded('CriticalCheck'),
+        ne(stageDependencies.Plan.GeneratePlan.outputs['planStep.hasDestructiveChanges'], 'true')
+      )
+    jobs:
+      - job: AutoApproveJob
+        displayName: "Auto-Approve Non-Destructive Changes"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - script: |
+              echo "═══════════════════════════════════════════════════════════"
+              echo "  AUTO-APPROVED: No destructive changes detected"
+              echo "  Environment: ${{ parameters.environment }}"
+              echo "  Proceeding directly to Apply stage."
+              echo "═══════════════════════════════════════════════════════════"
+            displayName: "Auto-Approve Confirmation"
+
+  # =============================================================================
+  # Stage 6: Apply
+  #
+  # Applies the Terraform plan. Only runs after either ManualApproval
+  # or AutoApprove has succeeded. Both paths converge here.
+  #
+  # The apply uses the SAVED plan file from the Plan stage — it does NOT
+  # re-plan. This ensures what was reviewed is exactly what gets applied.
+  # =============================================================================
+  - stage: Apply
+    displayName: "Terraform Apply"
+    dependsOn:
+      - Plan
+      - ManualApproval
+      - AutoApprove
+    condition: |
+      and(
+        succeeded('Plan'),
+        or(
+          succeeded('ManualApproval'),
+          succeeded('AutoApprove')
+        )
+      )
+    jobs:
+      - deployment: ApplyChanges
+        displayName: "Apply Terraform Changes"
+        pool:
+          vmImage: "ubuntu-latest"
+        environment: "${{ parameters.environment }}-apply"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  displayName: "Install Terraform"
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download Plan Artifact"
+                  inputs:
+                    artifact: "terraform-plan-${{ parameters.environment }}"
+                    path: "$(Pipeline.Workspace)/plan"
+
+                - task: AzureCLI@2
+                  displayName: "Terraform Apply"
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      set -euo pipefail
+
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      export ARM_USE_OIDC=true
+
+                      # Initialize Terraform
+                      terraform -chdir=$(terraformDir) init \
+                        -backend-config="resource_group_name=$(backendResourceGroup)" \
+                        -backend-config="storage_account_name=$(backendStorageAccount)" \
+                        -backend-config="container_name=$(backendContainer)" \
+                        -backend-config="key=${{ parameters.environment }}.terraform.tfstate" \
+                        -input=false
+
+                      # Back up state before apply
+                      echo "=== Backing up state ==="
+                      bash $(scriptsDir)/state-migration.sh backup -d $(terraformDir) || true
+
+                      # Apply the SAVED plan (not a re-plan)
+                      echo "=== Applying saved plan ==="
+                      terraform -chdir=$(terraformDir) apply \
+                        -input=false \
+                        "$(Pipeline.Workspace)/plan/tfplan.binary"
+
+                      echo ""
+                      echo "═══════════════════════════════════════════════════════"
+                      echo "  APPLY COMPLETE"
+                      echo "  Environment: ${{ parameters.environment }}"
+                      echo "═══════════════════════════════════════════════════════"
+
+  # =============================================================================
+  # Stage 7: Verify
+  # =============================================================================
+  - stage: Verify
+    displayName: "Verify & Compliance"
+    dependsOn: Apply
+    condition: succeeded()
+    jobs:
+      - job: PostApplyValidation
+        displayName: "Post-Apply Validation"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform"
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: AzureCLI@2
+            displayName: "Verify No Drift"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                export ARM_USE_OIDC=true
+
+                terraform -chdir=$(terraformDir) init \
+                  -backend-config="resource_group_name=$(backendResourceGroup)" \
+                  -backend-config="storage_account_name=$(backendStorageAccount)" \
+                  -backend-config="container_name=$(backendContainer)" \
+                  -backend-config="key=${{ parameters.environment }}.terraform.tfstate" \
+                  -input=false
+
+                echo "=== Post-Apply Drift Detection ==="
+                terraform -chdir=$(terraformDir) plan \
+                  -var-file="environments/${{ parameters.environment }}.tfvars" \
+                  -input=false \
+                  -detailed-exitcode || DRIFT_EXIT=$?
+
+                if [ "${DRIFT_EXIT:-0}" -eq 2 ]; then
+                  echo "⚠️  WARNING: Drift detected after apply!"
+                  echo "This may indicate external changes or provider bugs."
+                  exit 1
+                else
+                  echo "✅ No drift detected. State matches infrastructure."
+                fi
+
+          - task: AzureCLI@2
+            displayName: "Validate AKS Clusters Health"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                echo "=== AKS Cluster Health Check ==="
+
+                # List all AKS clusters in the environment
+                CLUSTERS=$(az aks list \
+                  --query "[?tags.environment=='${{ parameters.environment }}'].{Name:name, RG:resourceGroup, State:provisioningState}" \
+                  -o json)
+
+                echo "$CLUSTERS" | jq -r '.[] | "\(.Name) (\(.RG)): \(.State)"'
+
+                # Check for any clusters not in "Succeeded" state
+                UNHEALTHY=$(echo "$CLUSTERS" | jq '[.[] | select(.State != "Succeeded")] | length')
+
+                if [ "$UNHEALTHY" -gt 0 ]; then
+                  echo "⚠️  $UNHEALTHY cluster(s) in unhealthy state!"
+                  exit 1
+                else
+                  echo "✅ All AKS clusters healthy."
+                fi
+
+          - task: AzureCLI@2
+            displayName: "Validate Key Vault Access"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                echo "=== Key Vault Access Validation ==="
+
+                # List Key Vaults in environment
+                VAULTS=$(az keyvault list \
+                  --query "[?tags.environment=='${{ parameters.environment }}'].name" -o tsv)
+
+                for vault in $VAULTS; do
+                  echo "Checking $vault..."
+
+                  # Verify vault is accessible
+                  az keyvault show --name "$vault" --query "{Name:name, RBAC:properties.enableRbacAuthorization, SoftDelete:properties.enableSoftDelete}" -o table
+
+                  # Verify a secret can be listed (confirms RBAC is working)
+                  az keyvault secret list --vault-name "$vault" --query "length(@)" -o tsv && \
+                    echo "  ✅ Secret access OK" || \
+                    echo "  ❌ Secret access FAILED"
+                done

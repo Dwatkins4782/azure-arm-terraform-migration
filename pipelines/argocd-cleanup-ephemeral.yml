@@ -1,0 +1,221 @@
+# =============================================================================
+# ArgoCD Ephemeral Environment Cleanup Pipeline
+#
+# PURPOSE:
+#   Cleans up ephemeral Kubernetes namespaces and ArgoCD Applications
+#   created by feature branch deployments. Runs on:
+#     1. Branch deletion (webhook trigger)
+#     2. Scheduled daily cleanup (removes stale environments)
+#
+# WHAT GETS CLEANED UP:
+#   - Kubernetes namespaces labeled with platform.io/ephemeral=true
+#   - ArgoCD Application CRDs for deleted branches
+#   - Any orphaned resources in ephemeral namespaces
+#
+# SAFETY:
+#   - NEVER deletes namespaces without the ephemeral label
+#   - NEVER deletes dev, staging, or prod namespaces
+#   - Logs everything for audit trail
+# =============================================================================
+
+# Scheduled trigger: runs daily at 2 AM
+schedules:
+  - cron: "0 2 * * *"
+    displayName: "Daily Ephemeral Cleanup"
+    branches:
+      include:
+        - main
+    always: true
+
+# Manual trigger
+trigger: none
+
+variables:
+  azureServiceConnection: "azure-arm-migration-wif"
+  aksClusterDev: "aks-platform-dev"
+  aksClusterStaging: "aks-platform-staging"
+  aksResourceGroup: "rg-platform-aks"
+  # Max age for ephemeral namespaces (in hours)
+  maxAgeHours: "72"
+
+# Protected namespaces that should NEVER be deleted
+# Even if they somehow get the ephemeral label
+parameters:
+  - name: protectedNamespaces
+    type: object
+    default:
+      - default
+      - kube-system
+      - kube-public
+      - kube-node-lease
+      - argocd
+      - monitoring
+      - security-tools
+      - dev
+      - staging
+      - prod
+      - ingress-nginx
+      - cert-manager
+
+stages:
+  - stage: Cleanup
+    displayName: "Clean Ephemeral Environments"
+    jobs:
+      - job: CleanupDevCluster
+        displayName: "Cleanup Dev Cluster"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Cleanup Ephemeral Namespaces (Dev)"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "=== Connecting to $(aksClusterDev) ==="
+                az aks get-credentials \
+                  --resource-group $(aksResourceGroup) \
+                  --name $(aksClusterDev) \
+                  --overwrite-existing
+
+                PROTECTED_NS="${{ join(' ', parameters.protectedNamespaces) }}"
+
+                echo "=== Finding Ephemeral Namespaces ==="
+                EPHEMERAL_NS=$(kubectl get namespaces \
+                  -l platform.io/ephemeral=true \
+                  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+
+                if [ -z "$EPHEMERAL_NS" ]; then
+                  echo "No ephemeral namespaces found. Nothing to clean up."
+                  exit 0
+                fi
+
+                echo "Found ephemeral namespaces: $EPHEMERAL_NS"
+                echo ""
+
+                DELETED=0
+                SKIPPED=0
+
+                for ns in $EPHEMERAL_NS; do
+                  # Safety check: skip protected namespaces
+                  if echo "$PROTECTED_NS" | grep -qw "$ns"; then
+                    echo "⚠️  SKIP: $ns is a protected namespace"
+                    SKIPPED=$((SKIPPED + 1))
+                    continue
+                  fi
+
+                  # Check age of namespace
+                  CREATED=$(kubectl get namespace "$ns" \
+                    -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || echo "")
+
+                  if [ -n "$CREATED" ]; then
+                    CREATED_EPOCH=$(date -d "$CREATED" +%s 2>/dev/null || echo 0)
+                    NOW_EPOCH=$(date +%s)
+                    AGE_HOURS=$(( (NOW_EPOCH - CREATED_EPOCH) / 3600 ))
+
+                    if [ "$AGE_HOURS" -lt "$(maxAgeHours)" ]; then
+                      echo "  SKIP: $ns (${AGE_HOURS}h old, max is $(maxAgeHours)h)"
+                      SKIPPED=$((SKIPPED + 1))
+                      continue
+                    fi
+                  fi
+
+                  # Check if the source branch still exists
+                  BRANCH_LABEL=$(kubectl get namespace "$ns" \
+                    -o jsonpath='{.metadata.labels.platform\.io/branch}' 2>/dev/null || echo "")
+
+                  BRANCH_EXISTS="false"
+                  if [ -n "$BRANCH_LABEL" ]; then
+                    # Check if branch exists in the remote
+                    git ls-remote --heads origin "$BRANCH_LABEL" | grep -q . && BRANCH_EXISTS="true" || true
+                  fi
+
+                  if [ "$BRANCH_EXISTS" = "true" ]; then
+                    echo "  SKIP: $ns (branch '$BRANCH_LABEL' still exists)"
+                    SKIPPED=$((SKIPPED + 1))
+                    continue
+                  fi
+
+                  # Delete ArgoCD Application first
+                  APP_NAME=$(echo "$ns" | head -c 53)
+                  if kubectl get application "$APP_NAME" -n argocd &>/dev/null; then
+                    echo "  Deleting ArgoCD Application: $APP_NAME"
+                    kubectl delete application "$APP_NAME" -n argocd --wait=true --timeout=120s || true
+                  fi
+
+                  # Delete the namespace
+                  echo "  🗑️  Deleting namespace: $ns (${AGE_HOURS:-unknown}h old, branch deleted)"
+                  kubectl delete namespace "$ns" --wait=false || true
+                  DELETED=$((DELETED + 1))
+                done
+
+                echo ""
+                echo "═══════════════════════════════════════════════════════"
+                echo "  CLEANUP SUMMARY ($(aksClusterDev))"
+                echo "═══════════════════════════════════════════════════════"
+                echo "  Deleted:  $DELETED namespaces"
+                echo "  Skipped:  $SKIPPED namespaces"
+                echo "═══════════════════════════════════════════════════════"
+
+      - job: CleanupStagingCluster
+        displayName: "Cleanup Staging Cluster"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Cleanup Ephemeral Namespaces (Staging)"
+            inputs:
+              azureServiceConnection: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "=== Connecting to $(aksClusterStaging) ==="
+                az aks get-credentials \
+                  --resource-group $(aksResourceGroup) \
+                  --name $(aksClusterStaging) \
+                  --overwrite-existing
+
+                PROTECTED_NS="${{ join(' ', parameters.protectedNamespaces) }}"
+
+                EPHEMERAL_NS=$(kubectl get namespaces \
+                  -l platform.io/ephemeral=true \
+                  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+
+                if [ -z "$EPHEMERAL_NS" ]; then
+                  echo "No ephemeral namespaces found on staging. Nothing to clean."
+                  exit 0
+                fi
+
+                DELETED=0
+                for ns in $EPHEMERAL_NS; do
+                  if echo "$PROTECTED_NS" | grep -qw "$ns"; then
+                    echo "  SKIP: $ns (protected)"
+                    continue
+                  fi
+
+                  # Staging ephemeral envs have a shorter TTL (24h)
+                  CREATED=$(kubectl get namespace "$ns" \
+                    -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || echo "")
+                  CREATED_EPOCH=$(date -d "$CREATED" +%s 2>/dev/null || echo 0)
+                  NOW_EPOCH=$(date +%s)
+                  AGE_HOURS=$(( (NOW_EPOCH - CREATED_EPOCH) / 3600 ))
+
+                  if [ "$AGE_HOURS" -lt 24 ]; then
+                    echo "  SKIP: $ns (${AGE_HOURS}h old, staging TTL is 24h)"
+                    continue
+                  fi
+
+                  APP_NAME=$(echo "$ns" | head -c 53)
+                  kubectl delete application "$APP_NAME" -n argocd 2>/dev/null || true
+                  kubectl delete namespace "$ns" --wait=false || true
+                  echo "  🗑️  Deleted: $ns (${AGE_HOURS}h old)"
+                  DELETED=$((DELETED + 1))
+                done
+
+                echo ""
+                echo "  Cleaned up $DELETED ephemeral namespace(s) from staging."

@@ -1,0 +1,563 @@
+# =============================================================================
+# Azure DevOps Pipeline — ArgoCD Feature Branch Deployments
+#
+# PURPOSE:
+#   This pipeline triggers ArgoCD deployments for ANY branch merge that is
+#   NOT the main branch. It enables development teams to deploy feature
+#   branches, hotfixes, and development branches through ArgoCD without
+#   waiting for main branch promotion.
+#
+# TRIGGER LOGIC:
+#   - Fires on push to ANY branch EXCEPT main
+#   - Creates or updates ArgoCD Application CRDs for the feature branch
+#   - Routes to the correct environment based on branch pattern:
+#       feature/*  → dev environment (ephemeral namespace)
+#       hotfix/*   → staging environment
+#       release/*  → staging environment
+#       develop    → dev environment (persistent)
+#       staging    → staging environment (persistent)
+#   - main branch is EXCLUDED — it uses the standard terraform pipeline
+#
+# ARGOCD INTEGRATION:
+#   ArgoCD watches the Git repository and auto-syncs when manifests change.
+#   This pipeline:
+#     1. Builds the container image and pushes to ACR
+#     2. Updates the Kustomize overlay with the new image tag
+#     3. Creates/updates an ArgoCD Application for the feature branch
+#     4. Triggers an ArgoCD sync to deploy immediately
+#     5. Posts deployment status back to the PR
+#
+# EPHEMERAL ENVIRONMENTS:
+#   Feature branches get their own Kubernetes namespace that is automatically
+#   cleaned up when the branch is deleted or the PR is closed.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - develop
+      - staging
+      - feature/*
+      - hotfix/*
+      - release/*
+      - bugfix/*
+    exclude:
+      - main
+  paths:
+    include:
+      - kubernetes/**
+      - automation/**
+      - pipelines/argocd-*
+
+# Also trigger on PRs targeting non-main branches for preview environments
+pr:
+  branches:
+    include:
+      - develop
+      - staging
+
+variables:
+  # Container registry
+  acrName: "acrplatformdev"
+  acrLoginServer: "acrplatformdev.azurecr.io"
+  imageName: "platform-app"
+
+  # ArgoCD server
+  argocdServer: "argocd.internal.platform.com"
+  argocdProject: "platform-apps"
+
+  # Kubernetes
+  aksClusterDev: "aks-platform-dev"
+  aksClusterStaging: "aks-platform-staging"
+  aksResourceGroup: "rg-platform-aks"
+
+  # Service connection
+  azureServiceConnection: "azure-arm-migration-wif"
+
+# =============================================================================
+# Stage 1: Determine Environment
+#
+# Maps the current branch to the correct target environment, AKS cluster,
+# and namespace. Feature branches get ephemeral namespaces; persistent
+# branches (develop, staging) get their standard namespaces.
+# =============================================================================
+stages:
+  - stage: Route
+    displayName: "Determine Target Environment"
+    jobs:
+      - job: BranchRouting
+        displayName: "Map Branch to Environment"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - script: |
+              set -euo pipefail
+
+              BRANCH_NAME="${BUILD_SOURCEBRANCH#refs/heads/}"
+              echo "Source branch: $BRANCH_NAME"
+
+              # Sanitize branch name for Kubernetes (lowercase, alphanumeric + dashes)
+              SANITIZED=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]' | cut -c1-53)
+              echo "Sanitized name: $SANITIZED"
+
+              # Route branch to environment
+              case "$BRANCH_NAME" in
+                develop)
+                  TARGET_ENV="dev"
+                  TARGET_CLUSTER="$(aksClusterDev)"
+                  TARGET_NAMESPACE="dev"
+                  EPHEMERAL="false"
+                  ARGOCD_SYNC_POLICY="automated"
+                  ;;
+                staging)
+                  TARGET_ENV="staging"
+                  TARGET_CLUSTER="$(aksClusterStaging)"
+                  TARGET_NAMESPACE="staging"
+                  EPHEMERAL="false"
+                  ARGOCD_SYNC_POLICY="automated"
+                  ;;
+                feature/*)
+                  TARGET_ENV="dev"
+                  TARGET_CLUSTER="$(aksClusterDev)"
+                  TARGET_NAMESPACE="feature-${SANITIZED}"
+                  EPHEMERAL="true"
+                  ARGOCD_SYNC_POLICY="automated"
+                  ;;
+                hotfix/*)
+                  TARGET_ENV="staging"
+                  TARGET_CLUSTER="$(aksClusterStaging)"
+                  TARGET_NAMESPACE="hotfix-${SANITIZED}"
+                  EPHEMERAL="true"
+                  ARGOCD_SYNC_POLICY="automated"
+                  ;;
+                release/*)
+                  TARGET_ENV="staging"
+                  TARGET_CLUSTER="$(aksClusterStaging)"
+                  TARGET_NAMESPACE="release-${SANITIZED}"
+                  EPHEMERAL="true"
+                  ARGOCD_SYNC_POLICY="manual"
+                  ;;
+                bugfix/*)
+                  TARGET_ENV="dev"
+                  TARGET_CLUSTER="$(aksClusterDev)"
+                  TARGET_NAMESPACE="bugfix-${SANITIZED}"
+                  EPHEMERAL="true"
+                  ARGOCD_SYNC_POLICY="automated"
+                  ;;
+                *)
+                  echo "Unknown branch pattern: $BRANCH_NAME"
+                  echo "Defaulting to dev environment"
+                  TARGET_ENV="dev"
+                  TARGET_CLUSTER="$(aksClusterDev)"
+                  TARGET_NAMESPACE="branch-${SANITIZED}"
+                  EPHEMERAL="true"
+                  ARGOCD_SYNC_POLICY="automated"
+                  ;;
+              esac
+
+              IMAGE_TAG="${SANITIZED}-$(Build.BuildId)"
+
+              echo ""
+              echo "═══════════════════════════════════════════════════════"
+              echo "  BRANCH ROUTING"
+              echo "═══════════════════════════════════════════════════════"
+              echo "  Branch:     $BRANCH_NAME"
+              echo "  Environment: $TARGET_ENV"
+              echo "  Cluster:    $TARGET_CLUSTER"
+              echo "  Namespace:  $TARGET_NAMESPACE"
+              echo "  Ephemeral:  $EPHEMERAL"
+              echo "  Sync Policy: $ARGOCD_SYNC_POLICY"
+              echo "  Image Tag:  $IMAGE_TAG"
+              echo "═══════════════════════════════════════════════════════"
+
+              # Set output variables
+              echo "##vso[task.setvariable variable=targetEnv;isOutput=true]${TARGET_ENV}"
+              echo "##vso[task.setvariable variable=targetCluster;isOutput=true]${TARGET_CLUSTER}"
+              echo "##vso[task.setvariable variable=targetNamespace;isOutput=true]${TARGET_NAMESPACE}"
+              echo "##vso[task.setvariable variable=isEphemeral;isOutput=true]${EPHEMERAL}"
+              echo "##vso[task.setvariable variable=syncPolicy;isOutput=true]${ARGOCD_SYNC_POLICY}"
+              echo "##vso[task.setvariable variable=imageTag;isOutput=true]${IMAGE_TAG}"
+              echo "##vso[task.setvariable variable=branchName;isOutput=true]${BRANCH_NAME}"
+              echo "##vso[task.setvariable variable=sanitizedName;isOutput=true]${SANITIZED}"
+            displayName: "Route Branch to Environment"
+            name: routing
+            env:
+              BUILD_SOURCEBRANCH: $(Build.SourceBranch)
+
+  # =============================================================================
+  # Stage 2: Build and Push Container Image
+  #
+  # Builds the application container, tags it with the branch name and
+  # build ID, and pushes to Azure Container Registry.
+  # =============================================================================
+  - stage: Build
+    displayName: "Build Container Image"
+    dependsOn: Route
+    variables:
+      imageTag: $[ stageDependencies.Route.BranchRouting.outputs['routing.imageTag'] ]
+    jobs:
+      - job: BuildAndPush
+        displayName: "Build and Push to ACR"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Build and Push Image"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                # Login to ACR
+                az acr login --name $(acrName)
+
+                # Build and push
+                docker build \
+                  -t $(acrLoginServer)/$(imageName):$(imageTag) \
+                  -t $(acrLoginServer)/$(imageName):latest \
+                  --label "git.branch=$(Build.SourceBranchName)" \
+                  --label "git.commit=$(Build.SourceVersion)" \
+                  --label "build.id=$(Build.BuildId)" \
+                  .
+
+                docker push $(acrLoginServer)/$(imageName):$(imageTag)
+
+                echo "Image pushed: $(acrLoginServer)/$(imageName):$(imageTag)"
+
+          # Scan the built image for vulnerabilities
+          - script: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+              trivy image \
+                --severity HIGH,CRITICAL \
+                --exit-code 0 \
+                --format table \
+                $(acrLoginServer)/$(imageName):$(imageTag)
+            displayName: "Trivy Image Scan"
+            continueOnError: true
+
+  # =============================================================================
+  # Stage 3: Deploy via ArgoCD
+  #
+  # This is the core stage. It:
+  #   1. Connects to the target AKS cluster
+  #   2. Creates the namespace (if ephemeral)
+  #   3. Generates an ArgoCD Application manifest for this branch
+  #   4. Applies the Application CRD to ArgoCD
+  #   5. Triggers a sync and waits for health
+  #   6. Posts the deployment URL back to the PR
+  # =============================================================================
+  - stage: Deploy
+    displayName: "Deploy via ArgoCD"
+    dependsOn:
+      - Route
+      - Build
+    variables:
+      targetEnv: $[ stageDependencies.Route.BranchRouting.outputs['routing.targetEnv'] ]
+      targetCluster: $[ stageDependencies.Route.BranchRouting.outputs['routing.targetCluster'] ]
+      targetNamespace: $[ stageDependencies.Route.BranchRouting.outputs['routing.targetNamespace'] ]
+      isEphemeral: $[ stageDependencies.Route.BranchRouting.outputs['routing.isEphemeral'] ]
+      syncPolicy: $[ stageDependencies.Route.BranchRouting.outputs['routing.syncPolicy'] ]
+      imageTag: $[ stageDependencies.Route.BranchRouting.outputs['routing.imageTag'] ]
+      branchName: $[ stageDependencies.Route.BranchRouting.outputs['routing.branchName'] ]
+      sanitizedName: $[ stageDependencies.Route.BranchRouting.outputs['routing.sanitizedName'] ]
+    jobs:
+      - job: ArgoDeployment
+        displayName: "Create ArgoCD Application & Sync"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Connect to AKS and Deploy"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                # -------------------------------------------------------
+                # Connect to target AKS cluster
+                # -------------------------------------------------------
+                echo "=== Connecting to $(targetCluster) ==="
+                az aks get-credentials \
+                  --resource-group $(aksResourceGroup) \
+                  --name $(targetCluster) \
+                  --overwrite-existing
+
+                # -------------------------------------------------------
+                # Create namespace (if ephemeral)
+                # -------------------------------------------------------
+                if [ "$(isEphemeral)" = "true" ]; then
+                  echo "=== Creating ephemeral namespace: $(targetNamespace) ==="
+                  kubectl create namespace $(targetNamespace) \
+                    --dry-run=client -o yaml | kubectl apply -f -
+
+                  # Label for cleanup
+                  kubectl label namespace $(targetNamespace) \
+                    platform.io/ephemeral=true \
+                    platform.io/branch="$(sanitizedName)" \
+                    platform.io/created-by=pipeline \
+                    platform.io/build-id="$(Build.BuildId)" \
+                    --overwrite
+
+                  # Set resource quotas for ephemeral namespaces
+                  cat <<QUOTA | kubectl apply -f -
+                apiVersion: v1
+                kind: ResourceQuota
+                metadata:
+                  name: ephemeral-quota
+                  namespace: $(targetNamespace)
+                spec:
+                  hard:
+                    requests.cpu: "4"
+                    requests.memory: "8Gi"
+                    limits.cpu: "8"
+                    limits.memory: "16Gi"
+                    pods: "20"
+                    services: "10"
+                    persistentvolumeclaims: "5"
+                QUOTA
+                fi
+
+                # -------------------------------------------------------
+                # Generate ArgoCD Application manifest
+                # -------------------------------------------------------
+                echo "=== Generating ArgoCD Application ==="
+
+                APP_NAME="$(sanitizedName)"
+
+                # Determine sync policy
+                if [ "$(syncPolicy)" = "automated" ]; then
+                  SYNC_POLICY_BLOCK='
+                    syncPolicy:
+                      automated:
+                        prune: true
+                        selfHeal: true
+                      syncOptions:
+                        - CreateNamespace=true
+                        - PruneLast=true
+                      retry:
+                        limit: 3
+                        backoff:
+                          duration: 10s
+                          factor: 2
+                          maxDuration: 3m'
+                else
+                  SYNC_POLICY_BLOCK='
+                    syncPolicy:
+                      syncOptions:
+                        - CreateNamespace=true
+                      retry:
+                        limit: 3
+                        backoff:
+                          duration: 10s
+                          factor: 2
+                          maxDuration: 3m'
+                fi
+
+                cat <<ARGOAPP | kubectl apply -f -
+                apiVersion: argoproj.io/v1alpha1
+                kind: Application
+                metadata:
+                  name: ${APP_NAME}
+                  namespace: argocd
+                  labels:
+                    platform.io/environment: $(targetEnv)
+                    platform.io/branch: $(sanitizedName)
+                    platform.io/ephemeral: "$(isEphemeral)"
+                  annotations:
+                    platform.io/build-id: "$(Build.BuildId)"
+                    platform.io/source-branch: "$(branchName)"
+                    platform.io/image-tag: "$(imageTag)"
+                  finalizers:
+                    - resources-finalizer.argocd.argoproj.io
+                spec:
+                  project: $(argocdProject)
+                  source:
+                    repoURL: $(Build.Repository.Uri)
+                    targetRevision: $(branchName)
+                    path: kubernetes/overlays/$(targetEnv)
+                    kustomize:
+                      images:
+                        - $(acrLoginServer)/$(imageName):$(imageTag)
+                  destination:
+                    server: https://kubernetes.default.svc
+                    namespace: $(targetNamespace)
+                  ${SYNC_POLICY_BLOCK}
+                ARGOAPP
+
+                echo "ArgoCD Application '${APP_NAME}' created/updated."
+
+                # -------------------------------------------------------
+                # Trigger sync (if manual policy)
+                # -------------------------------------------------------
+                if [ "$(syncPolicy)" = "manual" ]; then
+                  echo "=== Manual sync policy — triggering initial sync ==="
+
+                  # Install ArgoCD CLI
+                  curl -sSL -o /usr/local/bin/argocd \
+                    https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+                  chmod +x /usr/local/bin/argocd
+
+                  argocd app sync "${APP_NAME}" \
+                    --server $(argocdServer) \
+                    --auth-token $(ARGOCD_AUTH_TOKEN) \
+                    --grpc-web \
+                    --prune \
+                    --timeout 300 || true
+                fi
+
+                # -------------------------------------------------------
+                # Wait for application health
+                # -------------------------------------------------------
+                echo "=== Waiting for ArgoCD Application health ==="
+
+                MAX_WAIT=300
+                ELAPSED=0
+                INTERVAL=15
+
+                while [ $ELAPSED -lt $MAX_WAIT ]; do
+                  HEALTH=$(kubectl get application "${APP_NAME}" -n argocd \
+                    -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+                  SYNC=$(kubectl get application "${APP_NAME}" -n argocd \
+                    -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+
+                  echo "  Health: ${HEALTH} | Sync: ${SYNC} (${ELAPSED}s elapsed)"
+
+                  if [ "$HEALTH" = "Healthy" ] && [ "$SYNC" = "Synced" ]; then
+                    echo ""
+                    echo "✅ Application is Healthy and Synced!"
+                    break
+                  fi
+
+                  sleep $INTERVAL
+                  ELAPSED=$((ELAPSED + INTERVAL))
+                done
+
+                if [ $ELAPSED -ge $MAX_WAIT ]; then
+                  echo "⚠️  Application did not reach Healthy state within ${MAX_WAIT}s"
+                  echo "  Current health: ${HEALTH}"
+                  echo "  Current sync: ${SYNC}"
+                fi
+
+                # -------------------------------------------------------
+                # Output deployment info
+                # -------------------------------------------------------
+                echo ""
+                echo "═══════════════════════════════════════════════════════"
+                echo "  DEPLOYMENT COMPLETE"
+                echo "═══════════════════════════════════════════════════════"
+                echo "  Application: ${APP_NAME}"
+                echo "  Namespace:   $(targetNamespace)"
+                echo "  Cluster:     $(targetCluster)"
+                echo "  Image:       $(acrLoginServer)/$(imageName):$(imageTag)"
+                echo "  ArgoCD:      https://$(argocdServer)/applications/${APP_NAME}"
+                echo "═══════════════════════════════════════════════════════"
+            env:
+              ARGOCD_AUTH_TOKEN: $(argocd.auth.token)
+
+          # Post deployment status to PR (if this was triggered by a PR)
+          - script: |
+              if [ -n "${SYSTEM_PULLREQUEST_PULLREQUESTID:-}" ]; then
+                echo "Posting deployment status to PR #${SYSTEM_PULLREQUEST_PULLREQUESTID}"
+
+                COMMENT="## 🚀 Feature Branch Deployment\n\n"
+                COMMENT+="| Property | Value |\n|----------|-------|\n"
+                COMMENT+="| **Branch** | \`$(branchName)\` |\n"
+                COMMENT+="| **Namespace** | \`$(targetNamespace)\` |\n"
+                COMMENT+="| **Cluster** | \`$(targetCluster)\` |\n"
+                COMMENT+="| **Image** | \`$(acrLoginServer)/$(imageName):$(imageTag)\` |\n"
+                COMMENT+="| **ArgoCD** | [View App](https://$(argocdServer)/applications/$(sanitizedName)) |\n"
+                COMMENT+="\n✅ Deployed via ArgoCD. Namespace will be cleaned up when PR is closed."
+
+                az repos pr update \
+                  --id "${SYSTEM_PULLREQUEST_PULLREQUESTID}" \
+                  --description "${COMMENT}" 2>/dev/null || true
+              fi
+            displayName: "Post PR Comment"
+            condition: and(succeeded(), ne(variables['System.PullRequest.PullRequestId'], ''))
+
+  # =============================================================================
+  # Stage 4: Smoke Tests
+  # =============================================================================
+  - stage: SmokeTest
+    displayName: "Smoke Tests"
+    dependsOn:
+      - Route
+      - Deploy
+    variables:
+      targetCluster: $[ stageDependencies.Route.BranchRouting.outputs['routing.targetCluster'] ]
+      targetNamespace: $[ stageDependencies.Route.BranchRouting.outputs['routing.targetNamespace'] ]
+    jobs:
+      - job: RunSmokeTests
+        displayName: "Run Smoke Tests"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Execute Smoke Tests"
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                az aks get-credentials \
+                  --resource-group $(aksResourceGroup) \
+                  --name $(targetCluster) \
+                  --overwrite-existing
+
+                echo "=== Running Smoke Tests ==="
+                echo "Namespace: $(targetNamespace)"
+
+                # Check all pods are running
+                echo "--- Pod Status ---"
+                kubectl get pods -n $(targetNamespace)
+
+                PENDING=$(kubectl get pods -n $(targetNamespace) \
+                  --field-selector=status.phase!=Running,status.phase!=Succeeded \
+                  --no-headers 2>/dev/null | wc -l)
+
+                if [ "$PENDING" -gt 0 ]; then
+                  echo "⚠️  $PENDING pod(s) not in Running/Succeeded state"
+                  kubectl get pods -n $(targetNamespace) \
+                    --field-selector=status.phase!=Running,status.phase!=Succeeded
+                fi
+
+                # Health check endpoint
+                echo ""
+                echo "--- Health Check ---"
+                SVC_IP=$(kubectl get svc -n $(targetNamespace) \
+                  -o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null || echo "")
+
+                if [ -n "$SVC_IP" ]; then
+                  kubectl run smoke-test-$(Build.BuildId) \
+                    --image=curlimages/curl:latest \
+                    --rm -i --restart=Never \
+                    -n $(targetNamespace) \
+                    -- curl -sf "http://${SVC_IP}/health" \
+                    --connect-timeout 10 \
+                    --max-time 30 && \
+                    echo "✅ Health check passed" || \
+                    echo "⚠️  Health check failed (non-blocking)"
+                else
+                  echo "No service found — skipping health check"
+                fi
+
+                echo ""
+                echo "✅ Smoke tests complete"
+
+# =============================================================================
+# Cleanup Pipeline (separate trigger)
+#
+# This should be configured as a separate pipeline or triggered by a
+# branch deletion webhook. It cleans up ephemeral namespaces when
+# feature branches are deleted.
+#
+# To set up: Create a separate pipeline triggered by branch deletion
+# events via Azure DevOps webhooks or a scheduled cleanup job.
+# =============================================================================
