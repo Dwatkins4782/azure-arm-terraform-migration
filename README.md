@@ -72,7 +72,12 @@ azure-arm-terraform-migration/
 │   ├── aztfexport-wrapper.sh        # Enterprise aztfexport automation
 │   ├── validate-parity.sh           # ARM vs Terraform parity validation
 │   ├── state-migration.sh           # Safe state import/move operations
-│   └── check-critical-resources.sh  # Pipeline safety gate script
+│   ├── check-critical-resources.sh  # Pipeline safety gate script
+│   └── migrations/
+│       ├── rbac-migration.sh            # Key Vault RBAC blue-green migration
+│       ├── migration-config.env.template # RBAC migration config template
+│       ├── aks-upgrade.sh               # AKS K8s version blue-green upgrade
+│       └── upgrade-config.env.template  # AKS upgrade config template
 │
 ├── kubernetes/
 │   └── argocd/
@@ -113,6 +118,7 @@ azure-arm-terraform-migration/
 | ArgoCD GitOps | ApplicationSets for multi-env deployment, feature branch ephemeral environments, automated cleanup |
 | Pipeline Safety Gates | Critical resource protection — automated detection of cascade-destructive Terraform changes |
 | Incident Response | Root cause analysis documentation for Key Vault RBAC migration cascade incident |
+| Blue-Green Migrations | Automated Key Vault RBAC migration and AKS K8s version upgrade with gates, health checks, and rollback |
 
 ## Quick Start
 
@@ -186,6 +192,55 @@ feature/my-feature branch  ──→  Build Image  ──→  Push to ACR
                                                Branch deleted ──→ Cleanup pipeline
                                                removes namespace + ArgoCD app
 ```
+
+## Migration Automation Scripts
+
+Automated scripts with blue-green strategies, mandatory gates, health checks, and rollback capabilities.
+
+### Key Vault RBAC Migration
+
+Safely migrates Key Vault from Access Policies to RBAC without causing the cascade-destruction incident that can destroy 50+ AKS clusters.
+
+```bash
+# 1. Copy and configure
+cp scripts/migrations/migration-config.env.template scripts/migrations/migration-config.env
+vi scripts/migrations/migration-config.env
+
+# 2. Dry run first
+./scripts/migrations/rbac-migration.sh --config scripts/migrations/migration-config.env --dry-run
+
+# 3. Run with interactive gates
+./scripts/migrations/rbac-migration.sh --config scripts/migrations/migration-config.env
+
+# 4. Rollback if needed
+./scripts/migrations/rbac-migration.sh --config scripts/migrations/migration-config.env --rollback
+```
+
+**7 mandatory gates**: Pre-flight, Replication verification, RBAC access verification, Canary cluster validation, Batch cluster health, Post-stabilization health, Terraform alignment.
+
+### AKS Kubernetes Version Upgrade
+
+Upgrades AKS clusters using blue-green node pools — creates new pools on the target version, drains old pools, validates, then removes old pools.
+
+```bash
+# 1. Copy and configure
+cp scripts/migrations/upgrade-config.env.template scripts/migrations/upgrade-config.env
+vi scripts/migrations/upgrade-config.env
+
+# 2. Dry run first
+./scripts/migrations/aks-upgrade.sh --config scripts/migrations/upgrade-config.env --dry-run
+
+# 3. Control plane only (node pools separately)
+./scripts/migrations/aks-upgrade.sh --config scripts/migrations/upgrade-config.env --control-plane-only
+
+# 4. Full upgrade with interactive gates
+./scripts/migrations/aks-upgrade.sh --config scripts/migrations/upgrade-config.env
+
+# 5. Rollback (uncordon blue pools, delete green pools)
+./scripts/migrations/aks-upgrade.sh --config scripts/migrations/upgrade-config.env --rollback
+```
+
+**6 mandatory gates**: Pre-flight (version compat, PDB check), Control plane verification, Green pool readiness, Workload migration, Application health (ArgoCD sync, endpoints), Final verification.
 
 ## Conversion Methodology
 
